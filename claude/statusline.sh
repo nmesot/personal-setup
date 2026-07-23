@@ -27,29 +27,42 @@ SEP="${SEP_C} │ ${RESET}"
 # Resolve the current branch's PR check status and cache it. Run in the
 # background so the status line never blocks on the network. A lock dir
 # prevents concurrent refreshes from piling up.
+#
+# The cache is only replaced once a valid new response is in hand: we write to
+# a temp file and atomically mv it into place. A transient gh failure leaves
+# the last-known status untouched so the bar never blanks out mid-refresh.
 refresh_ci() {
   local branch="$1" dir="$2" cache="$3" lock="${3}.lock"
+  local raw="${cache}.raw" tmp="${cache}.new"
   mkdir "$lock" 2>/dev/null || return 0
-  local json counts
-  json=$( (cd "$dir" && gh pr checks "$branch" --json state) 2>/dev/null )
-  if [ -z "$json" ]; then
-    printf 'nopr 0 0 0 0' > "$cache"
-    rmdir "$lock" 2>/dev/null
-    return 0
+  local json err counts
+  (cd "$dir" && gh pr checks "$branch" --json state) >"$raw" 2>"${raw}.err"
+  json=$(cat "$raw" 2>/dev/null)
+  err=$(cat "${raw}.err" 2>/dev/null)
+  rm -f "$raw" "${raw}.err"
+  if [ -n "$json" ]; then
+    # Categorize each check by state: passed, pending, notstarted, failed.
+    # SKIPPED/NEUTRAL are ignored (not shown, not counted).
+    counts=$(echo "$json" | jq -r '
+      def cat(s):
+        if   s=="SUCCESS" then "pass"
+        elif s=="IN_PROGRESS" or s=="PENDING" then "pend"
+        elif s=="QUEUED" or s=="WAITING" or s=="REQUESTED" or s=="EXPECTED" then "wait"
+        elif s=="SKIPPED" or s=="NEUTRAL" then "skip"
+        else "fail" end;
+      reduce .[] as $c ({pass:0,pend:0,wait:0,fail:0};
+        (cat($c.state)) as $k | if $k=="skip" then . else .[$k] += 1 end)
+      | "ok \(.pass) \(.pend) \(.wait) \(.fail)"' 2>/dev/null)
+    if [ -n "$counts" ]; then
+      printf '%s' "$counts" > "$tmp" && mv -f "$tmp" "$cache"
+    fi
+  elif printf '%s' "$err" | grep -qiE 'no (pull request|check)'; then
+    # Definitively no PR / no checks for this branch: record an empty state so
+    # we stop retrying every render. Safe — this branch has no status to keep.
+    printf 'none 0 0 0 0' > "$tmp" && mv -f "$tmp" "$cache"
   fi
-  # Categorize each check by its state into: passed, pending, notstarted, failed.
-  # SKIPPED/NEUTRAL are ignored (not shown, not counted).
-  counts=$(echo "$json" | jq -r '
-    def cat(s):
-      if   s=="SUCCESS" then "pass"
-      elif s=="IN_PROGRESS" or s=="PENDING" then "pend"
-      elif s=="QUEUED" or s=="WAITING" or s=="REQUESTED" or s=="EXPECTED" then "wait"
-      elif s=="SKIPPED" or s=="NEUTRAL" then "skip"
-      else "fail" end;
-    reduce .[] as $c ({pass:0,pend:0,wait:0,fail:0};
-      (cat($c.state)) as $k | if $k=="skip" then . else .[$k] += 1 end)
-    | "ok \(.pass) \(.pend) \(.wait) \(.fail)"' 2>/dev/null)
-  printf '%s' "${counts:-ok 0 0 0 0}" > "$cache"
+  # Any other (transient) failure: leave the existing cache untouched so the
+  # last known status keeps showing until a real response arrives.
   rmdir "$lock" 2>/dev/null
 }
 
