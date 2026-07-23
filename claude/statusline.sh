@@ -18,7 +18,40 @@ CTX_RED='\033[38;5;203m'
 CTX_EMPTY='\033[38;5;238m'
 TOKIN_C='\033[38;5;111m'  # light blue
 TOKOUT_C='\033[38;5;180m' # light tan
+CI_PASS_C='\033[38;5;114m' # green
+CI_FAIL_C='\033[38;5;203m' # coral red
+CI_PEND_C='\033[38;5;214m' # amber
+CI_WAIT_C='\033[38;5;244m' # grey (not started)
 SEP="${SEP_C} │ ${RESET}"
+
+# Resolve the current branch's PR check status and cache it. Run in the
+# background so the status line never blocks on the network. A lock dir
+# prevents concurrent refreshes from piling up.
+refresh_ci() {
+  local branch="$1" dir="$2" cache="$3" lock="${3}.lock"
+  mkdir "$lock" 2>/dev/null || return 0
+  local json counts
+  json=$( (cd "$dir" && gh pr checks "$branch" --json state) 2>/dev/null )
+  if [ -z "$json" ]; then
+    printf 'nopr 0 0 0 0' > "$cache"
+    rmdir "$lock" 2>/dev/null
+    return 0
+  fi
+  # Categorize each check by its state into: passed, pending, notstarted, failed.
+  # SKIPPED/NEUTRAL are ignored (not shown, not counted).
+  counts=$(echo "$json" | jq -r '
+    def cat(s):
+      if   s=="SUCCESS" then "pass"
+      elif s=="IN_PROGRESS" or s=="PENDING" then "pend"
+      elif s=="QUEUED" or s=="WAITING" or s=="REQUESTED" or s=="EXPECTED" then "wait"
+      elif s=="SKIPPED" or s=="NEUTRAL" then "skip"
+      else "fail" end;
+    reduce .[] as $c ({pass:0,pend:0,wait:0,fail:0};
+      (cat($c.state)) as $k | if $k=="skip" then . else .[$k] += 1 end)
+    | "ok \(.pass) \(.pend) \(.wait) \(.fail)"' 2>/dev/null)
+  printf '%s' "${counts:-ok 0 0 0 0}" > "$cache"
+  rmdir "$lock" 2>/dev/null
+}
 
 model=$(echo "$input" | jq -r '.model.display_name // "?"')
 dir=$(echo "$input" | jq -r '.workspace.current_dir // .cwd // "?"')
@@ -77,6 +110,33 @@ if git --no-optional-locks -C "$dir" rev-parse --is-inside-work-tree >/dev/null 
   fi
 fi
 
+# CI status for the current branch's PR, read from a background-refreshed cache.
+ci_display=""
+if [ -n "$branch" ] && command -v gh >/dev/null 2>&1; then
+  repo_root=$(git --no-optional-locks -C "$dir" rev-parse --show-toplevel 2>/dev/null)
+  ci_key=$(printf '%s' "${repo_root}#${branch}" | md5 -q 2>/dev/null)
+  ci_cache="/tmp/claude-statusline-ci-${ci_key}.txt"
+  now=$(date +%s)
+  ci_mtime=0
+  [ -f "$ci_cache" ] && ci_mtime=$(stat -f %m "$ci_cache" 2>/dev/null || echo 0)
+  if [ $(( now - ci_mtime )) -ge 60 ]; then
+    refresh_ci "$branch" "$dir" "$ci_cache" >/dev/null 2>&1 &
+  fi
+  ci_tag=""; ci_pass=0; ci_pend=0; ci_wait=0; ci_fail=0
+  if [ -f "$ci_cache" ]; then
+    read -r ci_tag ci_pass ci_pend ci_wait ci_fail < "$ci_cache" 2>/dev/null
+  fi
+  if [ "$ci_tag" = "ok" ] && [ $(( ci_pass + ci_pend + ci_wait + ci_fail )) -gt 0 ]; then
+    # Show each non-zero category in its own color. Problems first.
+    parts=""
+    [ "$ci_fail" -gt 0 ] && parts="${parts} ${CI_FAIL_C}✗${ci_fail}${RESET}"
+    [ "$ci_pend" -gt 0 ] && parts="${parts} ${CI_PEND_C}●${ci_pend}${RESET}"
+    [ "$ci_wait" -gt 0 ] && parts="${parts} ${CI_WAIT_C}○${ci_wait}${RESET}"
+    [ "$ci_pass" -gt 0 ] && parts="${parts} ${CI_PASS_C}✓${ci_pass}${RESET}"
+    ci_display="${SEP_C} CI${RESET}${parts}"
+  fi
+fi
+
 cost_display=$(printf '%.2f' "$cost")
 
 secs=$(( duration_ms / 1000 ))
@@ -119,5 +179,5 @@ if [ -n "$branch" ]; then
   git_display="${SEP_C} on ${RESET}${branch_color}${branch}${dirty}${RESET}"
 fi
 
-printf "${MODEL_C}%s${RESET}${SEP}${COST_C}\$%s${RESET}${SEP}%b${SEP}${TOKIN_C}↑%s${RESET}/${TOKOUT_C}↓%s${RESET}${SEP}${DUR_C}%s${RESET}${SEP}${ADDED_C}+%s${RESET}/${REMOVED_C}-%s${RESET}${SEP}${DIR_C}%s${RESET}%b\n" \
-  "$model" "$cost_display" "$ctx_display" "$in_tokens_display" "$out_tokens_display" "$dur_display" "$added" "$removed" "$dir_display" "$git_display"
+printf "${MODEL_C}%s${RESET}${SEP}${COST_C}\$%s${RESET}${SEP}%b${SEP}${TOKIN_C}↑%s${RESET}/${TOKOUT_C}↓%s${RESET}${SEP}${DUR_C}%s${RESET}${SEP}${ADDED_C}+%s${RESET}/${REMOVED_C}-%s${RESET}${SEP}${DIR_C}%s${RESET}%b%b\n" \
+  "$model" "$cost_display" "$ctx_display" "$in_tokens_display" "$out_tokens_display" "$dur_display" "$added" "$removed" "$dir_display" "$git_display" "$ci_display"
