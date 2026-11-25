@@ -1,0 +1,1 @@
+{ "name": "cat-band", "version": "0.1.0", "description": "A little cat above the prompt: walks while Claude works, naps while idle", "types": "./types/index.d.ts" }
